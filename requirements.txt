@@ -1,0 +1,12 @@
+# Python dependencies for Overflight Night Feed Generator
+
+# Core dependencies
+requests>=2.31.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Progress bar
+tqdm>=4.66.0
+
+# URL/HTTP utilities (included with requests)
+urllib3>=2.0.0

@@ -1,0 +1,40 @@
+# Cache directory
+scripts/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Cache for media files
+*_cache/
+cache/
+
+# Reports (keep sample)
+reports/*
+!reports/.gitkeep
+!reports/sample_report.csv
+
+# Environment
+.env
+.venv
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
