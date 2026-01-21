@@ -6,17 +6,21 @@ Uses robust image analysis with luminance-based darkness classification—not ju
 
 ## 🌟 Features
 
+- **Daylight Veto System**: Hard rejection of any video with bright sky content (v2.0)
+- **Multi-frame Analysis**: Analyzes 3 frames per video (at 3s, 12s, 24s) using worst-case metrics
+- **Border/Letterbox Detection**: Automatically crops black borders before analysis
+- **HSV Sky Detection**: Detects low-saturation bright pixels (sky-like content)
 - **Real darkness analysis**: Measures actual luminance from video frames/thumbnails using ITU-R BT.709 standards
 - **Intelligent frame extraction**: Automatically extracts representative frames when thumbnails aren't available
 - **Hybrid classification**: Combines metadata keywords with measured darkness metrics
 - **Sunset filtering**: Includes only dark-ish sunsets based on configurable thresholds
 - **Production-ready**: Concurrent processing, retries, timeouts, caching, and deterministic output
 - **Auto-updating**: GitHub Actions workflow regenerates feed daily
-- **Detailed reports**: Optional CSV/JSON analysis reports for transparency
+- **Detailed reports**: JSON/TXT analysis reports with all metrics and decision rules
 
 ## 📊 How It Works
 
-### Darkness Classification Process
+### Darkness Classification Process (v2.0)
 
 1. **Metadata Gating** (lightweight, not sufficient alone)
    - Scans `title` and `location` for keywords:
@@ -26,26 +30,44 @@ Uses robust image analysis with luminance-based darkness classification—not ju
 
 2. **Image Acquisition**
    - Uses thumbnail if available (`url_img`, `image`, `thumbnail`, etc.)
-   - Otherwise extracts frame at ~4 seconds from video using ffmpeg
+   - Otherwise extracts **3 frames** at 3s, 12s, 24s from video using ffmpeg
+   - **Border cropping**: Automatically detects and removes letterbox borders
 
 3. **Luminance Analysis**
    - Converts sRGB → linear RGB
    - Computes luminance: **Y = 0.2126R + 0.7152G + 0.0722B**
    - Calculates metrics:
      - `median_Y`: Median luminance
-     - `p25_Y`, `p75_Y`: 25th/75th percentile luminance
+     - `p25_Y`, `p75_Y`, `p90_Y`: 25th/75th/90th percentile luminance
      - `dark_pixel_ratio`: Fraction of pixels with Y < 0.18
+     - `bright_pixel_ratio`: Fraction of pixels with Y > 0.65
+     - `mid_bright_ratio`: Fraction of pixels with Y > 0.45
+     - `low_sat_bright_ratio`: Fraction of HSV pixels with V > 0.65 and S < 0.25 (sky-like)
+   - **Multi-frame**: Uses worst-case (brightest) metrics across all frames
 
-4. **Acceptance Rules**
+4. **🚫 Daylight Veto (HARD REJECT)**
    
-   **Night/Dark acceptance:**
-   - `median_Y ≤ 0.22` **OR**
-   - (`dark_pixel_ratio ≥ 0.65` AND `p75_Y ≤ 0.35`)
+   If ANY of these conditions are met, the video is **immediately rejected**:
+   - `bright_pixel_ratio ≥ 0.10` (>10% very bright pixels)
+   - `mid_bright_ratio ≥ 0.25` (>25% medium-bright pixels)
+   - `p75_Y ≥ 0.40` (75th percentile too bright)
+   - `p90_Y ≥ 0.55` (90th percentile too bright)
+   - `low_sat_bright_ratio ≥ 0.06` (>6% sky-like pixels)
+
+5. **Acceptance Rules** (only if daylight veto passes)
    
-   **Sunset acceptance (stricter):**
-   - `median_Y ≤ 0.28` **AND**
-   - `p25_Y ≤ 0.14` **AND**
-   - `dark_pixel_ratio ≥ 0.55`
+   **Night keyword content:**
+   - `median_Y ≤ 0.22` **OR** (`dark_pixel_ratio ≥ 0.65` AND `p75_Y ≤ 0.33`)
+   
+   **Sunset content (stricter):**
+   - `median_Y ≤ 0.26` AND `p25_Y ≤ 0.14` AND `dark_pixel_ratio ≥ 0.55` AND `p75_Y ≤ 0.36`
+   
+   **Neutral content (strictest):**
+   - Must pass night rules PLUS:
+   - `p75_Y ≤ 0.32` AND `p90_Y ≤ 0.45` AND `mid_bright_ratio ≤ 0.18`
+   
+   **Day keyword content:**
+   - Must have near-night profile: `median_Y ≤ 0.12`, `p75_Y ≤ 0.28`, `p90_Y ≤ 0.36`, `bright ≤ 0.03`
 
 ## 🚀 Quick Start
 

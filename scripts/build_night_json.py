@@ -1,449 +1,605 @@
 #!/usr/bin/env python3
 """
-Overflight Night Feed Generator
+Build Night JSON Feed for Overflight
 
-Generates a filtered JSON feed containing only night/dark aerial videos
-for Projectivy Overflight wallpaper plugin.
+This script:
+1. Reads video data from local videos.json (Apple Aerials feed)
+2. Analyzes each video for darkness using image/video frame analysis
+3. Generates night.json with only dark/night videos
+4. Creates detailed reports with enhanced metrics
+
+Enhanced v2.0:
+- Daylight veto reporting
+- Multi-frame analysis info
+- Border crop reporting
+- All new metrics (p90_y, bright_pixel_ratio, mid_bright_ratio, low_sat_bright_ratio)
+- Decision rule tracking
 """
 
-import argparse
-import csv
 import json
 import logging
+import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Dict, Optional, Any
 
-import requests
 from tqdm import tqdm
 
-from media_probe import ClassificationResult, MediaProbe
+# Add scripts directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
 
-# Configuration
-# Default to local videos.json if it exists, otherwise use upstream URL
-import os
-_LOCAL_JSON = Path(__file__).parent.parent / "videos.json"
-DEFAULT_UPSTREAM_URL = str(_LOCAL_JSON) if _LOCAL_JSON.exists() else "https://raw.githubusercontent.com/projectivy/overflight/main/videos.json"
-DEFAULT_OUTPUT_NAME = "night.json"
-DEFAULT_MAX_WORKERS = 8
+from media_probe import MediaProbe, ClassificationResult, DarknessMetrics
 
-# Setup logging
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler(),
+        logging.FileHandler('reports/build.log', encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
 
 
-class NightFeedBuilder:
-    """Builds filtered night feed from upstream JSON"""
+@dataclass
+class ProcessingStats:
+    """Statistics from processing run"""
+    total_items: int = 0
+    accepted: int = 0
+    rejected: int = 0
+    errors: int = 0
+    daylight_veto_count: int = 0
+    processing_time_seconds: float = 0.0
     
-    def __init__(
-        self,
-        upstream_url: str,
-        output_path: Path,
-        max_items: Optional[int] = None,
-        max_workers: int = DEFAULT_MAX_WORKERS,
-        cache_dir: Optional[Path] = None,
-        timeout: int = 30
-    ):
+    @property
+    def acceptance_rate(self) -> float:
+        if self.total_items == 0:
+            return 0.0
+        return (self.accepted / self.total_items) * 100
+
+
+class NightFeedBuilder:
+    """Builds the night-only video feed"""
+    
+    UPSTREAM_URL = "https://raw.githubusercontent.com/AmnesiaBeing/Aerial-Apple-tvos-videos-json/master/videos.json"
+    LOCAL_SOURCE = "videos.json"
+    
+    def __init__(self, 
+                 output_dir: Path = Path("."),
+                 workers: int = 8,
+                 save_debug_frames: int = 0):
         """
-        Initialize NightFeedBuilder
+        Initialize builder
         
         Args:
-            upstream_url: URL to upstream videos.json
-            output_path: Path for output night.json
-            max_items: Optional limit on items to process
-            max_workers: Max concurrent workers for analysis
-            cache_dir: Cache directory for media files
-            timeout: Request timeout in seconds
+            output_dir: Directory for output files
+            workers: Number of concurrent workers
+            save_debug_frames: If > 0, save debug frames for analysis
         """
-        self.upstream_url = upstream_url
-        self.output_path = output_path
-        self.max_items = max_items
-        self.max_workers = max_workers
-        self.media_probe = MediaProbe(cache_dir=cache_dir, timeout=timeout)
-        self.session = requests.Session()
+        self.output_dir = output_dir
+        self.workers = workers
+        self.save_debug_frames = save_debug_frames
         
-        # Configure retries
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
+        # Setup directories
+        self.reports_dir = output_dir / "reports"
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
         
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
+        # Initialize probe with debug frame saving if requested
+        self.probe = MediaProbe(save_debug_frames=save_debug_frames)
+        
+        # Results storage
+        self.results: List[Dict[str, Any]] = []
+        self.stats = ProcessingStats()
     
     def fetch_upstream_data(self) -> List[dict]:
         """
-        Fetch upstream JSON data
+        Fetch video data from local file
         
         Returns:
-            List of video items
+            List of video items from source feed
         """
-        logger.info(f"Fetching upstream data from: {self.upstream_url}")
+        source_path = self.output_dir / self.LOCAL_SOURCE
         
-        try:
-            # Check if it's a local file
-            if os.path.exists(self.upstream_url):
-                logger.info(f"Loading local file: {self.upstream_url}")
-                with open(self.upstream_url, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            else:
-                # Fetch from URL
-                response = self.session.get(
-                    self.upstream_url, 
-                    timeout=30
-                )
-                response.raise_for_status()
-                data = response.json()
-            
-            # Handle different JSON structures
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict) and 'videos' in data:
+        if not source_path.exists():
+            logger.error(f"Local source file not found: {source_path}")
+            logger.info(f"Please download the upstream feed to: {source_path}")
+            return []
+        
+        logger.info(f"Reading local source: {source_path}")
+        
+        with open(source_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Handle different JSON structures
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            if 'assets' in data:
+                items = data['assets']
+            elif 'videos' in data:
                 items = data['videos']
-            elif isinstance(data, dict) and 'items' in data:
+            elif 'items' in data:
                 items = data['items']
             else:
-                logger.error(f"Unexpected JSON structure: {type(data)}")
-                items = []
-            
-            logger.info(f"Fetched {len(items)} items from upstream")
-            
-            # Apply max_items limit if specified
-            if self.max_items:
-                items = items[:self.max_items]
-                logger.info(f"Limited to {len(items)} items")
-            
-            return items
-            
-        except requests.RequestException as e:
-            logger.error(f"Error fetching upstream data: {e}")
-            raise
-        except json.JSONDecodeError as e:
-            logger.error(f"Error parsing JSON: {e}")
-            raise
-    
-    def process_item(self, item: dict) -> tuple[dict, ClassificationResult]:
-        """
-        Process a single item
+                # Try to find a list in the dict values
+                for value in data.values():
+                    if isinstance(value, list) and len(value) > 0:
+                        items = value
+                        break
+                else:
+                    items = [data]
+        else:
+            items = [data]
         
-        Args:
-            item: Video item dict
-            
-        Returns:
-            (item, classification_result)
+        logger.info(f"Found {len(items)} video items in source")
+        return items
+    
+    def process_item(self, item: dict) -> Dict[str, Any]:
         """
+        Process a single video item
+        
+        Returns:
+            Result entry with classification details
+        """
+        title = item.get('title', item.get('name', 'Unknown'))
+        
         try:
-            result = self.media_probe.classify_item(item)
-            return item, result
-        except Exception as e:
-            logger.error(f"Error processing item '{item.get('title', 'unknown')}': {e}")
-            # Return a failed result
-            from media_probe import ClassificationResult
-            result = ClassificationResult(
-                accepted=False,
-                reason=f"Processing error: {str(e)}",
-                metrics=None,
-                metadata_category='unknown'
-            )
-            return item, result
-    
-    def build_feed(self, write_report: bool = False) -> dict:
-        """
-        Build night feed by filtering upstream data
-        
-        Args:
-            write_report: Whether to write detailed report
+            result = self.probe.classify_item(item)
             
-        Returns:
-            Dict with 'accepted' and 'rejected' items and results
-        """
-        # Fetch upstream data
-        items = self.fetch_upstream_data()
-        
-        if not items:
-            logger.warning("No items to process")
-            return {'accepted': [], 'rejected': []}
-        
-        # Process items concurrently
-        logger.info(f"Processing {len(items)} items with {self.max_workers} workers...")
-        
-        accepted_items = []
-        rejected_items = []
-        results_data = []
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all tasks
-            future_to_item = {
-                executor.submit(self.process_item, item): item 
-                for item in items
+            result_entry = {
+                'title': title,
+                'location': item.get('location', ''),
+                'accepted': result.accepted,
+                'reason': result.reason,
+                'metadata_category': result.metadata_category,
+                'daylight_veto': result.daylight_veto,
+                'decision_rule': result.decision_rule,
+                'media_source': result.media_source,
+                'original_item': item
             }
             
-            # Process completed tasks with progress bar
-            with tqdm(total=len(items), desc="Analyzing videos") as pbar:
-                for future in as_completed(future_to_item):
+            if result.metrics:
+                result_entry['metrics'] = {
+                    'median_y': round(result.metrics.median_y, 4),
+                    'p25_y': round(result.metrics.p25_y, 4),
+                    'p75_y': round(result.metrics.p75_y, 4),
+                    'p90_y': round(result.metrics.p90_y, 4),
+                    'dark_pixel_ratio': round(result.metrics.dark_pixel_ratio, 4),
+                    'mean_y': round(result.metrics.mean_y, 4),
+                    'bright_pixel_ratio': round(result.metrics.bright_pixel_ratio, 4),
+                    'mid_bright_ratio': round(result.metrics.mid_bright_ratio, 4),
+                    'low_sat_bright_ratio': round(result.metrics.low_sat_bright_ratio, 4),
+                    'frames_analyzed': result.metrics.frames_analyzed,
+                    'timestamps_used': result.metrics.timestamps_used,
+                    'border_crop': result.metrics.border_crop
+                }
+            
+            return result_entry
+            
+        except Exception as e:
+            logger.error(f"Error processing '{title}': {e}")
+            return {
+                'title': title,
+                'location': item.get('location', ''),
+                'accepted': False,
+                'reason': f"Processing error: {str(e)}",
+                'metadata_category': 'error',
+                'daylight_veto': False,
+                'decision_rule': 'error',
+                'media_source': 'error',
+                'original_item': item,
+                'error': str(e)
+            }
+    
+    def process_all(self, items: List[dict]) -> None:
+        """
+        Process all items concurrently
+        
+        Args:
+            items: List of video items to process
+        """
+        self.stats.total_items = len(items)
+        self.results = []
+        
+        start_time = time.time()
+        
+        logger.info(f"Processing {len(items)} items with {self.workers} workers...")
+        
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {executor.submit(self.process_item, item): item for item in items}
+            
+            with tqdm(total=len(items), desc="Analyzing videos", unit="video") as pbar:
+                for future in as_completed(futures):
                     try:
-                        item, result = future.result()
+                        result = future.result()
+                        self.results.append(result)
                         
-                        # Store result
-                        result_entry = {
-                            'title': item.get('title', ''),
-                            'location': item.get('location', ''),
-                            'accepted': result.accepted,
-                            'reason': result.reason,
-                            'metadata_category': result.metadata_category
-                        }
-                        
-                        if result.metrics:
-                            result_entry.update({
-                                'median_y': result.metrics.median_y,
-                                'p25_y': result.metrics.p25_y,
-                                'p75_y': result.metrics.p75_y,
-                                'dark_pixel_ratio': result.metrics.dark_pixel_ratio
-                            })
-                        
-                        results_data.append(result_entry)
-                        
-                        if result.accepted:
-                            accepted_items.append((item, result))
+                        if result['accepted']:
+                            self.stats.accepted += 1
                         else:
-                            rejected_items.append((item, result))
+                            self.stats.rejected += 1
+                            if result.get('daylight_veto'):
+                                self.stats.daylight_veto_count += 1
                         
+                        if 'error' in result:
+                            self.stats.errors += 1
+                            
                     except Exception as e:
-                        logger.error(f"Error processing future: {e}")
+                        logger.error(f"Future execution error: {e}")
+                        self.stats.errors += 1
                     
                     pbar.update(1)
         
-        logger.info(f"Processing complete: {len(accepted_items)} accepted, "
-                   f"{len(rejected_items)} rejected")
+        self.stats.processing_time_seconds = time.time() - start_time
         
-        # Write report if requested
-        if write_report:
-            self._write_report(results_data)
+        logger.info(f"Processing complete in {self.stats.processing_time_seconds:.1f}s")
+        logger.info(f"Accepted: {self.stats.accepted}, Rejected: {self.stats.rejected}, "
+                   f"Errors: {self.stats.errors}, Daylight Vetos: {self.stats.daylight_veto_count}")
+    
+    def build_feed(self) -> dict:
+        """
+        Build the final night.json feed structure
         
-        return {
-            'accepted': accepted_items,
-            'rejected': rejected_items,
-            'results': results_data
+        Returns:
+            Feed dict ready for JSON serialization
+        """
+        accepted_items = [r['original_item'] for r in self.results if r['accepted']]
+        
+        feed = {
+            "metadata": {
+                "generator": "overflight-night-feed v2.0",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "source": self.LOCAL_SOURCE,
+                "total_analyzed": self.stats.total_items,
+                "total_accepted": len(accepted_items),
+                "acceptance_rate": f"{self.stats.acceptance_rate:.1f}%",
+                "daylight_veto_count": self.stats.daylight_veto_count,
+                "processing_time_seconds": round(self.stats.processing_time_seconds, 1),
+                "version": "2.0",
+                "algorithm": "daylight_veto_with_multi_frame"
+            },
+            "assets": accepted_items
         }
+        
+        return feed
     
-    def _write_report(self, results_data: List[dict]):
-        """Write detailed analysis report"""
-        reports_dir = self.output_path.parent / 'reports'
-        reports_dir.mkdir(exist_ok=True)
+    def write_feed(self, feed: dict) -> Path:
+        """
+        Write feed to night.json
         
-        # Write CSV report
-        csv_path = reports_dir / 'analysis_report.csv'
-        logger.info(f"Writing analysis report to: {csv_path}")
+        Returns:
+            Path to output file
+        """
+        output_path = self.output_dir / "night.json"
         
-        fieldnames = [
-            'title', 'location', 'accepted', 'reason', 
-            'metadata_category', 'median_y', 'p25_y', 'p75_y', 
-            'dark_pixel_ratio'
-        ]
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(feed, f, indent=2, ensure_ascii=False)
         
-        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results_data)
-        
-        # Write JSON report
-        json_path = reports_dir / 'analysis_report.json'
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(results_data, f, indent=2)
-        
-        logger.info(f"Reports written to {reports_dir}")
+        logger.info(f"Wrote feed to: {output_path}")
+        return output_path
     
-    def write_output(self, accepted_items: List[tuple], dry_run: bool = False):
+    def write_report(self) -> Path:
         """
-        Write filtered output JSON
+        Write detailed classification report with enhanced metrics
         
-        Args:
-            accepted_items: List of (item, result) tuples
-            dry_run: If True, don't write file
+        Returns:
+            Path to report file
         """
-        # Extract just the items (without results)
-        output_items = [item for item, _ in accepted_items]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = self.reports_dir / f"classification_report_{timestamp}.json"
         
-        # Sort for deterministic output (by location, then title)
-        output_items.sort(key=lambda x: (x.get('location', ''), x.get('title', '')))
+        # Sort results for readability
+        accepted = sorted(
+            [r for r in self.results if r['accepted']],
+            key=lambda x: x['metrics'].get('median_y', 0) if 'metrics' in x else 0
+        )
         
-        if dry_run:
-            logger.info("DRY RUN: Would write output JSON with "
-                       f"{len(output_items)} items")
-            # Print first few items as preview
-            print("\nPreview (first 3 items):")
-            print(json.dumps(output_items[:3], indent=2))
-            return
+        rejected = sorted(
+            [r for r in self.results if not r['accepted']],
+            key=lambda x: x['metrics'].get('median_y', 1) if 'metrics' in x else 1,
+            reverse=True
+        )
         
-        # Write output file
-        logger.info(f"Writing output to: {self.output_path}")
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Group rejected by reason type
+        rejected_by_daylight_veto = [r for r in rejected if r.get('daylight_veto')]
+        rejected_by_rules = [r for r in rejected if not r.get('daylight_veto') and not r.get('error')]
+        rejected_by_error = [r for r in rejected if r.get('error')]
         
-        with open(self.output_path, 'w', encoding='utf-8') as f:
-            json.dump(output_items, f, indent=2)
+        report = {
+            "report_generated": datetime.now(timezone.utc).isoformat(),
+            "statistics": {
+                "total_items": self.stats.total_items,
+                "accepted": self.stats.accepted,
+                "rejected": self.stats.rejected,
+                "rejected_by_daylight_veto": len(rejected_by_daylight_veto),
+                "rejected_by_rules": len(rejected_by_rules),
+                "rejected_by_error": len(rejected_by_error),
+                "errors": self.stats.errors,
+                "acceptance_rate": f"{self.stats.acceptance_rate:.1f}%",
+                "processing_time_seconds": round(self.stats.processing_time_seconds, 1)
+            },
+            "thresholds_used": {
+                "veto_bright_pixel_ratio": 0.10,
+                "veto_mid_bright_ratio": 0.25,
+                "veto_p75_y": 0.40,
+                "veto_p90_y": 0.55,
+                "veto_low_sat_bright": 0.06,
+                "night_median_threshold": 0.22,
+                "night_dark_ratio_threshold": 0.65,
+                "night_p75_threshold": 0.33,
+                "neutral_p75_cap": 0.32,
+                "neutral_p90_cap": 0.45,
+                "neutral_mid_bright_cap": 0.18
+            },
+            "accepted_items": [
+                {
+                    "title": r['title'],
+                    "location": r['location'],
+                    "metadata_category": r['metadata_category'],
+                    "decision_rule": r['decision_rule'],
+                    "media_source": r.get('media_source', 'unknown'),
+                    "reason": r['reason'],
+                    "metrics": r.get('metrics', {})
+                }
+                for r in accepted
+            ],
+            "rejected_items": {
+                "daylight_veto": [
+                    {
+                        "title": r['title'],
+                        "location": r['location'],
+                        "metadata_category": r['metadata_category'],
+                        "decision_rule": r['decision_rule'],
+                        "media_source": r.get('media_source', 'unknown'),
+                        "reason": r['reason'],
+                        "metrics": r.get('metrics', {})
+                    }
+                    for r in rejected_by_daylight_veto
+                ],
+                "failed_rules": [
+                    {
+                        "title": r['title'],
+                        "location": r['location'],
+                        "metadata_category": r['metadata_category'],
+                        "decision_rule": r['decision_rule'],
+                        "media_source": r.get('media_source', 'unknown'),
+                        "reason": r['reason'],
+                        "metrics": r.get('metrics', {})
+                    }
+                    for r in rejected_by_rules
+                ],
+                "errors": [
+                    {
+                        "title": r['title'],
+                        "location": r['location'],
+                        "error": r.get('error', r['reason'])
+                    }
+                    for r in rejected_by_error
+                ]
+            }
+        }
         
-        logger.info(f"Successfully wrote {len(output_items)} items to {self.output_path}")
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Wrote classification report to: {report_path}")
+        
+        # Also write a simple summary to latest_report.json for easy access
+        latest_path = self.reports_dir / "latest_report.json"
+        with open(latest_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        
+        return report_path
     
-    def run(self, dry_run: bool = False, write_report: bool = False):
+    def write_summary_txt(self) -> Path:
         """
-        Run the complete pipeline
+        Write human-readable summary with decision explanations
         
-        Args:
-            dry_run: If True, don't write output file
-            write_report: If True, write detailed analysis report
+        Returns:
+            Path to summary file
+        """
+        summary_path = self.reports_dir / "summary.txt"
+        
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 70 + "\n")
+            f.write("OVERFLIGHT NIGHT FEED - CLASSIFICATION SUMMARY (v2.0)\n")
+            f.write("=" * 70 + "\n\n")
+            
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Processing time: {self.stats.processing_time_seconds:.1f} seconds\n\n")
+            
+            f.write("-" * 70 + "\n")
+            f.write("STATISTICS\n")
+            f.write("-" * 70 + "\n")
+            f.write(f"Total videos analyzed: {self.stats.total_items}\n")
+            f.write(f"Accepted (night/dark): {self.stats.accepted}\n")
+            f.write(f"Rejected: {self.stats.rejected}\n")
+            f.write(f"  - By daylight veto: {self.stats.daylight_veto_count}\n")
+            f.write(f"  - By other rules: {self.stats.rejected - self.stats.daylight_veto_count - self.stats.errors}\n")
+            f.write(f"  - By errors: {self.stats.errors}\n")
+            f.write(f"Acceptance rate: {self.stats.acceptance_rate:.1f}%\n\n")
+            
+            f.write("-" * 70 + "\n")
+            f.write("DAYLIGHT VETO THRESHOLDS\n")
+            f.write("-" * 70 + "\n")
+            f.write("Videos are REJECTED if ANY of these are exceeded:\n")
+            f.write("  bright_pixel_ratio >= 0.10 (>10% bright pixels)\n")
+            f.write("  mid_bright_ratio >= 0.25 (>25% medium-bright pixels)\n")
+            f.write("  p75_y >= 0.40 (75th percentile luminance too high)\n")
+            f.write("  p90_y >= 0.55 (90th percentile luminance too high)\n")
+            f.write("  low_sat_bright_ratio >= 0.06 (>6% sky-like pixels)\n\n")
+            
+            f.write("-" * 70 + "\n")
+            f.write("ACCEPTED VIDEOS (sorted by darkness)\n")
+            f.write("-" * 70 + "\n")
+            
+            accepted = sorted(
+                [r for r in self.results if r['accepted']],
+                key=lambda x: x['metrics'].get('median_y', 0) if 'metrics' in x else 0
+            )
+            
+            for r in accepted:
+                f.write(f"\n  {r['title']}")
+                if r['location']:
+                    f.write(f" ({r['location']})")
+                f.write("\n")
+                f.write(f"    Category: {r['metadata_category']}\n")
+                f.write(f"    Decision: {r['decision_rule']}\n")
+                if 'metrics' in r:
+                    m = r['metrics']
+                    f.write(f"    Metrics: median={m.get('median_y', 'N/A'):.3f}, "
+                           f"p75={m.get('p75_y', 'N/A'):.3f}, "
+                           f"p90={m.get('p90_y', 'N/A'):.3f}, "
+                           f"bright={m.get('bright_pixel_ratio', 'N/A'):.3f}\n")
+                    if m.get('frames_analyzed', 1) > 1:
+                        f.write(f"    Frames: {m['frames_analyzed']} @ {m.get('timestamps_used', [])}\n")
+            
+            f.write("\n" + "-" * 70 + "\n")
+            f.write("REJECTED VIDEOS (by reason)\n")
+            f.write("-" * 70 + "\n")
+            
+            # Group by reason type
+            rejected_veto = [r for r in self.results if not r['accepted'] and r.get('daylight_veto')]
+            rejected_rules = [r for r in self.results if not r['accepted'] and not r.get('daylight_veto') and not r.get('error')]
+            rejected_error = [r for r in self.results if not r['accepted'] and r.get('error')]
+            
+            if rejected_veto:
+                f.write("\n--- DAYLIGHT VETO (bright sky/daylight detected) ---\n")
+                for r in rejected_veto:
+                    f.write(f"\n  {r['title']}")
+                    if r['location']:
+                        f.write(f" ({r['location']})")
+                    f.write("\n")
+                    f.write(f"    Veto reason: {r['reason']}\n")
+                    if 'metrics' in r:
+                        m = r['metrics']
+                        f.write(f"    Metrics: median={m.get('median_y', 'N/A'):.3f}, "
+                               f"p75={m.get('p75_y', 'N/A'):.3f}, "
+                               f"p90={m.get('p90_y', 'N/A'):.3f}, "
+                               f"bright={m.get('bright_pixel_ratio', 'N/A'):.3f}, "
+                               f"sky={m.get('low_sat_bright_ratio', 'N/A'):.3f}\n")
+            
+            if rejected_rules:
+                f.write("\n--- FAILED ACCEPTANCE RULES ---\n")
+                for r in rejected_rules:
+                    f.write(f"\n  {r['title']}")
+                    if r['location']:
+                        f.write(f" ({r['location']})")
+                    f.write("\n")
+                    f.write(f"    Category: {r['metadata_category']}\n")
+                    f.write(f"    Reason: {r['reason']}\n")
+                    if 'metrics' in r:
+                        m = r['metrics']
+                        f.write(f"    Metrics: median={m.get('median_y', 'N/A'):.3f}, "
+                               f"p75={m.get('p75_y', 'N/A'):.3f}\n")
+            
+            if rejected_error:
+                f.write("\n--- ERRORS ---\n")
+                for r in rejected_error:
+                    f.write(f"\n  {r['title']}: {r.get('error', r['reason'])}\n")
+            
+            f.write("\n" + "=" * 70 + "\n")
+            f.write("END OF REPORT\n")
+            f.write("=" * 70 + "\n")
+        
+        logger.info(f"Wrote summary to: {summary_path}")
+        return summary_path
+    
+    def run(self) -> bool:
+        """
+        Run the full pipeline
+        
+        Returns:
+            True if successful, False otherwise
         """
         logger.info("=" * 60)
-        logger.info("Overflight Night Feed Generator")
-        logger.info("=" * 60)
-        logger.info(f"Upstream: {self.upstream_url}")
-        logger.info(f"Output: {self.output_path}")
-        logger.info(f"Max workers: {self.max_workers}")
-        logger.info(f"Max items: {self.max_items or 'unlimited'}")
+        logger.info("Starting Overflight Night Feed Builder v2.0")
         logger.info("=" * 60)
         
-        # Build feed
-        results = self.build_feed(write_report=write_report)
+        # Fetch source data
+        items = self.fetch_upstream_data()
+        if not items:
+            logger.error("No items to process")
+            return False
         
-        # Write output
-        self.write_output(results['accepted'], dry_run=dry_run)
+        # Process all items
+        self.process_all(items)
         
-        # Summary statistics
+        # Build and write feed
+        feed = self.build_feed()
+        self.write_feed(feed)
+        
+        # Write reports
+        self.write_report()
+        self.write_summary_txt()
+        
+        # Cleanup old cache
+        self.probe.cleanup_cache(max_age_days=7)
+        
         logger.info("=" * 60)
-        logger.info("Summary:")
-        logger.info(f"  Total items: {len(results['accepted']) + len(results['rejected'])}")
-        logger.info(f"  Accepted: {len(results['accepted'])}")
-        logger.info(f"  Rejected: {len(results['rejected'])}")
-        logger.info(f"  Acceptance rate: "
-                   f"{len(results['accepted']) / (len(results['accepted']) + len(results['rejected'])) * 100:.1f}%")
+        logger.info(f"Pipeline complete!")
+        logger.info(f"Accepted: {self.stats.accepted}/{self.stats.total_items} "
+                   f"({self.stats.acceptance_rate:.1f}%)")
+        logger.info(f"Daylight vetos: {self.stats.daylight_veto_count}")
         logger.info("=" * 60)
         
-        # Cleanup old cache files
-        self.media_probe.cleanup_cache(max_age_days=7)
+        return True
 
 
 def main():
     """Main entry point"""
+    import argparse
+    
     parser = argparse.ArgumentParser(
-        description='Generate night-only feed for Overflight',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic usage with default upstream URL
-  python build_night_json.py
-  
-  # Dry run to preview results
-  python build_night_json.py --dry-run
-  
-  # Generate with detailed report
-  python build_night_json.py --write-report
-  
-  # Use custom upstream URL and limit items
-  python build_night_json.py --upstream-url https://example.com/videos.json --max-items 50
-  
-  # Custom output location
-  python build_night_json.py --output ../night.json
-        """
+        description="Build night-only video feed for Overflight"
     )
-    
     parser.add_argument(
-        '--upstream-url',
-        default=DEFAULT_UPSTREAM_URL,
-        help=f'Upstream JSON URL (default: {DEFAULT_UPSTREAM_URL})'
-    )
-    
-    parser.add_argument(
-        '--output',
+        '--output-dir', '-o',
         type=Path,
-        default=Path(__file__).parent.parent / DEFAULT_OUTPUT_NAME,
-        help=f'Output file path (default: ../{DEFAULT_OUTPUT_NAME})'
+        default=Path("."),
+        help="Output directory (default: current directory)"
     )
-    
     parser.add_argument(
-        '--max-items',
+        '--workers', '-w',
         type=int,
-        help='Maximum items to process (for testing)'
+        default=8,
+        help="Number of concurrent workers (default: 8)"
     )
-    
     parser.add_argument(
-        '--max-workers',
+        '--debug-frames',
         type=int,
-        default=DEFAULT_MAX_WORKERS,
-        help=f'Max concurrent workers (default: {DEFAULT_MAX_WORKERS})'
+        default=0,
+        help="Save debug frames for analysis (0 = disabled)"
     )
-    
     parser.add_argument(
-        '--cache-dir',
-        type=Path,
-        help='Cache directory for media files'
-    )
-    
-    parser.add_argument(
-        '--timeout',
-        type=int,
-        default=30,
-        help='Request timeout in seconds (default: 30)'
-    )
-    
-    parser.add_argument(
-        '--dry-run',
+        '--verbose', '-v',
         action='store_true',
-        help='Preview results without writing output file'
-    )
-    
-    parser.add_argument(
-        '--write-report',
-        action='store_true',
-        help='Write detailed analysis report (CSV/JSON)'
-    )
-    
-    parser.add_argument(
-        '--verbose',
-        '-v',
-        action='store_true',
-        help='Enable verbose logging'
+        help="Enable verbose logging"
     )
     
     args = parser.parse_args()
     
-    # Set logging level
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    # Build feed
-    try:
-        builder = NightFeedBuilder(
-            upstream_url=args.upstream_url,
-            output_path=args.output,
-            max_items=args.max_items,
-            max_workers=args.max_workers,
-            cache_dir=args.cache_dir,
-            timeout=args.timeout
-        )
-        
-        builder.run(dry_run=args.dry_run, write_report=args.write_report)
-        
-        logger.info("Build complete!")
-        return 0
-        
-    except KeyboardInterrupt:
-        logger.warning("Build interrupted by user")
-        return 130
-    except Exception as e:
-        logger.error(f"Build failed: {e}", exc_info=True)
-        return 1
+    # Ensure reports directory exists
+    reports_dir = args.output_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    
+    builder = NightFeedBuilder(
+        output_dir=args.output_dir,
+        workers=args.workers,
+        save_debug_frames=args.debug_frames
+    )
+    
+    success = builder.run()
+    sys.exit(0 if success else 1)
 
 
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == "__main__":
+    main()
