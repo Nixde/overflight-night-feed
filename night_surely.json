@@ -41,14 +41,6 @@
   },
   {
     "location": "ISS",
-    "title": "Africa (night)",
-    "url_1080p": "http://sylvan.apple.com/Aerials/2x/Videos/comp_GMT312_162NC_139M_1041_AFRICA_NIGHT_v14_SDR_FINAL_20180706_SDR_2K_HEVC.mov",
-    "url_1080p_hdr": "http://sylvan.apple.com/Aerials/2x/Videos/comp_GMT312_162NC_139M_1041_AFRICA_NIGHT_v14_HDR_FINAL_20180706_HDR_2K_HEVC.mov",
-    "url_4k": "http://sylvan.apple.com/Aerials/2x/Videos/comp_GMT312_162NC_139M_1041_AFRICA_NIGHT_v14_SDR_FINAL_20180706_SDR_4K_HEVC.mov",
-    "url_4k_hdr": "http://sylvan.apple.com/Aerials/2x/Videos/comp_GMT312_162NC_139M_1041_AFRICA_NIGHT_v14_HDR_FINAL_20180706_HDR_4K_HEVC.mov"
-  },
-  {
-    "location": "ISS",
     "title": "Korea and Japan (night)",
     "url_1080p": "http://sylvan.apple.com/Aerials/2x/Videos/comp_GMT026_363A_103NC_E1027_KOREA_JAPAN_NIGHT_v17_SDR_FINAL_25062018_SDR_2K_HEVC.mov",
     "url_1080p_hdr": "http://sylvan.apple.com/Aerials/2x/Videos/comp_GMT026_363A_103NC_E1027_KOREA_JAPAN_NIGHT_v17_HDR_FINAL_25062018_HDR_2K_HEVC.mov",
