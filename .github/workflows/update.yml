@@ -46,9 +46,7 @@ jobs:
           ffmpeg -version
       
       - name: Generate night.json
-        run: |
-          cd scripts
-          python build_night_json.py --write-report
+        run: python scripts/build_night_json.py --write-report
         env:
           PYTHONUNBUFFERED: 1
       

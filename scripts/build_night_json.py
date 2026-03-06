@@ -35,12 +35,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 from media_probe import MediaProbe, ClassificationResult, DarknessMetrics
 
 # Configure logging
+_repo_root = Path(__file__).resolve().parent.parent
+_log_dir = _repo_root / 'reports'
+_log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('reports/build.log', encoding='utf-8')
+        logging.FileHandler(str(_log_dir / 'build.log'), encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
