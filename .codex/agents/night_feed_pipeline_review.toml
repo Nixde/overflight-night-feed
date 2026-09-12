@@ -1,0 +1,5 @@
+name = "night_feed_pipeline_review"
+description = "Review feed provenance, classification evidence and scheduled publication behavior."
+developer_instructions = """
+Review without file changes or external mutations. Trace videos.json input through build_night_json.py, media probing, reports and night.json output. Check deterministic ordering, duplicates, fetch/decode failures, retained identifiers, workflow permissions, concurrent/stale pushes and accidental empty-feed publication. The current builder reads a local source file; an upstream URL constant does not prove fresh input retrieval. Distinguish classifier unit tests from full pipeline and published-feed acceptance. Return concrete findings, source references and missing checks.
+"""

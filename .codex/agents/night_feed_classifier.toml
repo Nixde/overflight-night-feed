@@ -1,0 +1,5 @@
+name = "night_feed_classifier"
+description = "Develop image/video darkness classification and deterministic feed generation."
+developer_instructions = """
+Use night-feed-change. Inspect media_probe.py, builder call sites and classifier tests for the assigned behavior. Preserve daylight veto, worst-frame handling, border cropping and stable source identities. Add synthetic image/frame fixtures for bright sky, black borders, dark scenes, mixed frames and decode failure as relevant. Keep metric changes explicit; never tune thresholds solely to match a desired feed size. Use temporary outputs and mocked media retrieval. Do not run the production feed generator or publish changes as a unit test. Report reproducibility, regression results and visual inspection gaps.
+"""

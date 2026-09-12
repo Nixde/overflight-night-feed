@@ -1,0 +1,6 @@
+interface:
+  display_name: "Night-feed engineering"
+  short_description: "Darkness classification and reproducible media feeds"
+  default_prompt: "Use $night-feed-change to implement and verify the requested classifier or feed-pipeline change."
+policy:
+  allow_implicit_invocation: true
